@@ -1,61 +1,76 @@
 # MinifyEag
 
-Shrinks Eaglercraft client files. Works on offline `.html` clients and raw `.epk` asset packs.
+Shrinks Eaglercraft client files (`.html` offline clients and `.epk` packs). Single Python file, with a window or a command line.
 
 ## What it does
 
-1. **Audio:** re-encodes every `.ogg` inside the EPK to 24 kbps Vorbis. Sample rate and channels are kept, and sounds already at or below 24 kbps are left alone.
-2. **UTF-8 packing:** replaces the base64 assets in the HTML (about 33% bigger than the raw data) with a UTF-8 text encoding (about 14% bigger). The page decodes it at load time.
+1. **Audio**: every `.ogg` inside the EPK is re-encoded with Vorbis at the bitrate you choose (24 kbps recommended). Sounds already at or below the target are left alone. If a re-encode wouldn't come out smaller once compressed, the original audio is kept.
+2. **Remove audio** (optional): deletes every `.ogg` from the client and fixes the EPK file count so the game still loads. The game runs silent.
+3. **LZMA**: game JS, assets and lang packs are packed into LZMA streams grouped by kind. PNGs are stored as raw pixel rows (lossless) and rebuilt by the page. The page rebuilds an uncompressed EPK in memory.
+4. **Text encoding**: the binary payload is written into the html as text.
 
-Typical result: **about 10-15% smaller**. Most of the saving comes from the UTF-8 packing; audio only helps if the client has lots of high-bitrate sounds.
+| Encoding | Bits per char | Notes |
+|----------|---------------|-------|
+| `utf8`   | 7  | Works with any server or `fetch().text()` (+14%) |
+| `utf16`  | 15 | File is saved as UTF-16 with a BOM (+7%) |
+| `latin1` | 8  | Page is read as windows-1252 (+1.6%) |
+
+`utf16` and `latin1` only work when the browser reads the file itself (opened from disk or served unchanged), not if a launcher re-reads it as UTF-8 text.
+
+## Supported html layouts
+
+- `data:application/octet-stream;base64,...` assets URI
+- `var files = {...}` base64 table read by `decodeBase64ValueToU8()`
+- `<script type="application/octet-stream" id="eag-inline-*">` base64 blocks (newer single-file clients). EPK blocks are re-encoded and written back in the same format; the brotli wasm blocks are left as they are.
+- Large inline game scripts
 
 ## Requirements
 
-| Needs | Install |
-| --- | --- |
-| Python 3 | [python.org](https://www.python.org/downloads/) |
-| numpy | `pip install numpy` |
-| ffmpeg with libvorbis | [ffmpeg.org](https://ffmpeg.org/download.html) or `winget install ffmpeg` |
+- Python 3
+- `numpy`
+- `ffmpeg` with `libvorbis` (only needed for audio re-encoding)
+- `tkinter` for the window (on Linux: `sudo apt install python3-tk`)
 
-Check ffmpeg is on your PATH: `ffmpeg -version`
+Put `ffmpeg` / `ffmpeg.exe` next to the script, or have it on your `PATH`.
 
-## How to use
+## Usage
 
-1. Put `MinifyEag.py` in the same folder as your `.html` or `.epk` file.
-2. Open that folder in a terminal (cmd or PowerShell).
-3. Run:
+Window:
+
+```
+python MinifyEag.py
+```
+
+Command line:
 
 ```
 python MinifyEag.py client.html
+python MinifyEag.py a.html b.epk -k 24 -l 9 --max-rate 22050 --mono --encoding utf16
+python MinifyEag.py client.html --strip-audio
 ```
 
-or
+Output is saved next to the original as `name.small.html`. Originals are never changed.
 
-```
-python MinifyEag.py assets.epk
-```
+### Options
 
-The result is saved next to the original as `client.small.html` or `assets.small.epk`. Your original file is never changed.
-
-## Options
-
-| Flag | Meaning | Default |
-| --- | --- | --- |
-| `-o`, `--output` | Output file name | `<name>.small.<ext>` |
-| `-k`, `--kbps` | Audio bitrate | `24` |
-| `-j`, `--jobs` | Parallel ffmpeg jobs | CPU count |
-
-Example: `python MinifyEag.py client.html -k 32 -j 4`
-
-## Supported formats
-
-- HTML with a base64 `assetsURI` data URI
-- HTML with a `var files = { ... }` chunk table (WASM-GC offline builds)
-- Raw `.epk` files
-
-**Note:** in WASM-GC `.epw` assets, audio is left untouched and only the UTF-8 packing is applied.
+| Option | Description |
+|--------|-------------|
+| `-o, --output` | Output file (single input only) |
+| `-k, --kbps` | Audio bitrate (default 24) |
+| `--max-rate` | Cap the audio sample rate, e.g. `22050` |
+| `--mono` | Force mono audio |
+| `--no-audio` | Skip audio re-encoding |
+| `--strip-audio` | Remove all sounds (`.ogg`) from the client |
+| `--no-deflate` | Store big assets uncompressed (no LZMA) |
+| `--encoding` | `utf8` (default), `utf16` or `latin1` |
+| `-l, --level` | Compression level 1-9 (default 9) |
+| `-j, --jobs` | Worker threads |
+| `--ffmpeg` | Path to ffmpeg |
+| `--suffix` | Output name suffix (default `.small`) |
+| `--gui` | Open the window |
 
 ## Notes
 
-- Keep `<meta charset="UTF-8">` near the top of the HTML, or the text blocks will not load. The tool warns if it is missing.
-- Test the `.small` file in a browser before replacing your original.
+- Audio re-encoding is the slow part. A client with thousands of sounds can take several minutes on a single core.
+- On clients that are already brotli-packed, the gains are limited: only the sounds can be shrunk.
+- Always test the output in a browser. Removing audio and the `latin1`/`utf16` encodings change how the page loads.
