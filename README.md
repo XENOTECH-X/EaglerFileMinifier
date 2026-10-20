@@ -1,4 +1,4 @@
-# MinifyEag
+# EaglerFileMinifier
 
 Shrinks Eaglercraft client files (`.html` offline clients and `.epk` packs). Single Python file, with a window or a command line.
 
