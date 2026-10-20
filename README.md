@@ -17,6 +17,16 @@ Shrinks Eaglercraft client files (`.html` offline clients and `.epk` packs). Sin
 
 `utf16` and `latin1` only work when the browser reads the file itself (opened from disk or served unchanged), not if a launcher re-reads it as UTF-8 text.
 
+## Bundle mode
+
+`--bundle` (or the "Bundle" checkbox in the window) runs the normal packing, then gzips the whole finished page and writes it into the html as latin-1 text (8 bits per character). A small loader at the end unzips it with `DecompressionStream` and `document.write()`s the page. Packed payloads travel as raw binary inside the gzip, with no text encoding on top.
+
+- It helps on pages that store data as base64 text, because gzip undoes the 33% base64 overhead. On the hatrix client with audio removed, 43.3 MB became 32.5 MB.
+- It can't help on clients the script packs with LZMA, because gzip can't shrink LZMA output. In that case the script compares both results and writes the plain latin-1 page instead, so bundle mode is never larger than latin-1.
+- It needs a browser with `DecompressionStream` (any current Chrome, Edge, Firefox or Safari) and a page the browser reads itself (opened from disk or served unchanged), not one a launcher re-reads as UTF-8 text.
+- The page is rebuilt in memory at load, so it uses more RAM and starts a little slower.
+- It can't be combined with `--encoding utf16`.
+
 ## Supported html layouts
 
 - `data:application/octet-stream;base64,...` assets URI
@@ -61,6 +71,9 @@ Output is saved next to the original as `name.small.html`. Originals are never c
 | `--mono` | Force mono audio |
 | `--no-audio` | Skip audio re-encoding |
 | `--strip-audio` | Remove all sounds (`.ogg`) from the client |
+| `--langs` | Keep only these language files, e.g. `en_US` (comma separated) |
+| `--drop GLOB` | Remove EPK entries matching a pattern, e.g. `'assets/eagler/boot_menu/*'` (repeatable) |
+| `--bundle` | Gzip the whole finished page and store it as latin-1 text behind a tiny loader (smallest) |
 | `--no-deflate` | Store big assets uncompressed (no LZMA) |
 | `--encoding` | `utf8` (default), `utf16` or `latin1` |
 | `-l, --level` | Compression level 1-9 (default 9) |
