@@ -38,15 +38,15 @@ Put `ffmpeg` / `ffmpeg.exe` next to the script, or have it on your `PATH`.
 Window:
 
 ```
-python MinifyEag.py
+python EaglerFileMinifier.py
 ```
 
 Command line:
 
 ```
-python MinifyEag.py client.html
-python MinifyEag.py a.html b.epk -k 24 -l 9 --max-rate 22050 --mono --encoding utf16
-python MinifyEag.py client.html --strip-audio
+python EaglerFileMinifier.py client.html
+python EaglerFileMinifier.py a.html b.epk -k 24 -l 9 --max-rate 22050 --mono --encoding utf16
+python EaglerFileMinifier.py client.html --strip-audio
 ```
 
 Output is saved next to the original as `name.small.html`. Originals are never changed.
