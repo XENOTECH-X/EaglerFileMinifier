@@ -23,7 +23,7 @@ What it does
 
 needs: python 3, numpy, ffmpeg with libvorbis (only for the audio step)
 """
-import argparse, base64, lzma, os, queue, re, shutil, struct, subprocess, sys, threading, zlib
+import argparse, base64, fnmatch, lzma, os, queue, re, shutil, struct, subprocess, sys, threading, zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import numpy as np
@@ -41,7 +41,10 @@ class Cancelled(Exception):
 @dataclass
 class Opts:
     audio: bool = True
+    bundle: bool = False       # gzip the whole finished page and store it as latin1 text behind a tiny loader
     strip_audio: bool = False  # drop every .ogg from the EPKs (no sound at all)
+    drop: list = field(default_factory=list)  # glob patterns of EPK entries to remove
+    langs: str = ""            # keep only these language files (comma separated, e.g. en_US); empty = keep all
     kbps: int = RECOMMENDED_KBPS
     max_rate: int = 0          # 0 = keep original sample rate
     mono: bool = False
@@ -49,6 +52,8 @@ class Opts:
     level: int = 9             # 1 (fast) .. 9 (smallest)
     encoding: str = "utf8"     # how the binary payload is written into the html: utf8 | utf16 | latin1
     jobs: int = os.cpu_count() or 4
+    blobs: list = field(default_factory=list)
+    plain: object = None
     ffmpeg: str = "ffmpeg"
     cancel: threading.Event = field(default_factory=threading.Event)
 
@@ -131,9 +136,20 @@ def epk_build(head, comp, ents, tail, footer, o):
     return head + comp + body + footer
 
 
-def epk_strip_ogg(head, ents):
-    """drop .ogg entries and fix the file count stored at the end of the EPK header"""
-    keep = [e for e in ents if not e[1].lower().endswith(".ogg")]
+def epk_filter(head, ents, o):
+    """remove the entries the options ask to drop (all .ogg, glob patterns, unwanted .lang files) and
+    fix the file count stored at the end of the EPK header. returns (head, entries, removed)"""
+    pats = list(o.drop)
+    langs = {x.strip().lower() for x in o.langs.replace(";", ",").split(",") if x.strip()}
+    keep = []
+    for e in ents:
+        n = e[1]; low = n.lower()
+        gone = o.strip_audio and low.endswith(".ogg")
+        gone = gone or any(fnmatch.fnmatchcase(n, p) for p in pats)
+        if not gone and langs and e[0] == b"FILE" and low.endswith(".lang"):
+            gone = low.rsplit("/", 1)[-1][:-5] not in langs
+        if not gone:
+            keep.append(e)
     removed = len(ents) - len(keep)
     if removed:
         cnt = struct.unpack(">I", head[-4:])[0]
@@ -218,18 +234,17 @@ def rebuild_epk(raw, o, log, sub):
     gzip packs the original ogg files tightly (they share identical headers), so a smaller
     re-encode can still end up bigger once compressed - in that case the audio is left alone."""
     head, comp, ents, tail, footer = epk_parse(raw)
+    head, ents, removed = epk_filter(head, ents, o)
+    if removed:
+        log("  removed %d files" % removed)
     if o.strip_audio:
-        head, ents, removed = epk_strip_ogg(head, ents)
-        if not removed:
-            return raw
-        log("  removed %d ogg files" % removed)
-        return epk_build(head, comp, ents, tail, footer, o)
+        return epk_build(head, comp, ents, tail, footer, o) if removed else raw
     originals = [e[2] for e in ents]
     changed = shrink_audio(ents, o, log, sub) if o.audio else 0
     if not changed:
-        return epk_build(head, comp, ents, tail, footer, o) if (comp == b"0" and o.deflate) else raw
+        return epk_build(head, comp, ents, tail, footer, o) if ((comp == b"0" and o.deflate) or removed) else raw
     new = epk_build(head, comp, ents, tail, footer, o)
-    if comp in (b"G", b"Z"):
+    if comp in (b"G", b"Z") and not removed:
         base = raw
     else:
         for e, d in zip(ents, originals):
@@ -416,9 +431,9 @@ def pack_epk(raw, o, log, sub):
     The page rebuilds an (uncompressed) EPK in memory."""
     head, comp, ents, tail, footer = epk_parse(raw)
     tail0 = tail + footer
-    if o.strip_audio:
-        head, ents, removed = epk_strip_ogg(head, ents)
-        log("  removed %d ogg files" % removed)
+    head, ents, removed = epk_filter(head, ents, o)
+    if removed:
+        log("  removed %d files" % removed)
     originals = [e[2] for e in ents]
     changed = shrink_audio(ents, o, log, sub) if o.audio else 0
     order = ["px4", "pxo", "ogg", "txt", "bin"]
@@ -645,6 +660,9 @@ for(k=128;k<160;k++)M[D.decode(new Uint8Array([k])).charCodeAt(0)]=k;
 while(j<len){c=s.charCodeAt(i++);if(c>255)c=M[c];if(c==1)c=I[s.charCodeAt(i++)-48];o[j++]=c}
 e.remove();return o}
 """,
+    # bundle mode: the stub puts the payloads in window.__eagB as byte arrays
+    "raw": r"""function eaglerRead(id,len){var o=window.__eagB[id];delete window.__eagB[id];return o}
+""",
     # 15 bits per UTF-16 unit (page saved as UTF-16 with a BOM)
     "utf16": r"""function eaglerRead(id,len){
 var e=document.getElementById(id),s=e.textContent,o=new Uint8Array(len),j=0,a=0,n=0,i=0,l=s.length;
@@ -660,7 +678,7 @@ def build_decoder(encoding):
 
 # ------------------------------------------------------------ html layer ----
 PAY = re.compile(rb"\x00EAGPAY(\d+)\x00")
-ENCODINGS = ("utf8", "utf16", "latin1")
+ENCODINGS = ("utf8", "utf16", "latin1", "raw")
 
 
 class Pack:
@@ -787,6 +805,9 @@ def _ascii_shell(b):
 
 def finalize(html, pk, o, log):
     enc = o.encoding
+    if enc == "raw":  # bundle mode: payloads leave the html and travel as binary inside the gzip
+        o.blobs = [(i, c) for i, c in pk.items]
+        return PAY.sub(b"", html)
     def elem(k, packed_bytes):
         return b'<script type="text/plain" id="' + pk.items[k][0] + b'">' + packed_bytes + b"</script>\n"
     if enc == "utf8":
@@ -856,6 +877,7 @@ def html_pack(html, o, log, prog):
     if res is not None:
         return res
     pk = Pack()
+    o.blobs = []
     res = pack_datauri(html, o, log, prog, pk)
     if res is None:
         res = pack_files_table(html, o, log, prog, pk)
@@ -865,18 +887,66 @@ def html_pack(html, o, log, prog):
     if res is None:
         raise ValueError("couldn't find anything to shrink in this html (looked for base64 data URIs, a `var files = {...}` table and big inline scripts)")
     m = re.search(rb"<script[\s>]", res)  # decoder goes in front of the first script
-    res = res[:m.start()] + build_decoder(o.encoding) + res[m.start():]
-    return finalize(res, pk, o, log)
+    base = res
+    res = base[:m.start()] + build_decoder(o.encoding) + base[m.start():]
+    out = finalize(res, pk, o, log)
+    if o.encoding == "raw" and o.blobs:  # also build the plain latin1 page: gzip can't shrink LZMA'd payloads, so it may win
+        o.encoding = "latin1"
+        try:
+            o.plain = finalize(base[:m.start()] + build_decoder("latin1") + base[m.start():], pk, o, lambda *_: None)
+        finally:
+            o.encoding = "raw"
+    return out
 
 
 # ------------------------------------------------------------- one file -----
+BUNDLE_STUB = r"""<script>(async function(){var e=document.getElementById("eagler-bundle"),s=e.textContent,o=new Uint8Array(%d),j=0,i=0,c,k,M={},I=[0,13,60,1],D=new TextDecoder("windows-1252"),B=%s,off=%d,u,h;
+for(k=128;k<160;k++)M[D.decode(new Uint8Array([k])).charCodeAt(0)]=k;
+while(j<o.length){c=s.charCodeAt(i++);if(c>255)c=M[c];if(c==1)c=I[s.charCodeAt(i++)-48];o[j++]=c}
+e.remove();s="";
+u=new Uint8Array(await new Response(new Blob([o]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer());o=null;
+window.__eagB={};h=new TextDecoder().decode(u.subarray(0,off));
+for(k=0;k<B.length;k++){window.__eagB[B[k][0]]=u.subarray(off,off+B[k][1]);off+=B[k][1]}
+document.open();document.write(h);document.close()})()</script>
+"""
+
+
+def bundle_page(html, blobs, o, log):
+    """gzip the finished page plus its binary payloads, write that as 8-bit text (windows-1252) and put a
+    tiny loader in front. The loader gunzips it with DecompressionStream, hands the payloads to the page
+    as byte arrays (no text encoding overhead) and document.write()s the html."""
+    if html[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        raise ValueError("bundle mode can't be combined with utf16 output")
+    try:
+        html.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("bundle mode needs a UTF-8 page")
+    blob = html + b"".join(c for _, c in blobs)
+    c = zlib.compressobj(9, zlib.DEFLATED, 31)
+    gz = c.compress(blob) + c.flush()
+    log("bundle: %.2f MB page + %.2f MB payloads -> %.2f MB gzip" % (len(html) / 1e6, (len(blob) - len(html)) / 1e6, len(gz) / 1e6))
+    lst = "[" + ",".join('["%s",%d]' % (i.decode(), len(c_)) for i, c_ in blobs) + "]"
+    return (b'<!DOCTYPE html>\n<meta charset="windows-1252">\n<script type="text/plain" id="eagler-bundle">' + latin1_pack(gz)
+            + b"</script>\n" + (BUNDLE_STUB % (len(gz), lst, len(html))).encode() + b"<body style=margin:0;background:#000>\n")
+
+
 def process_file(src, dst, o, log=print, prog=lambda f: None):
     log("== %s" % os.path.basename(src))
     data = open(src, "rb").read()
     if data[:8] == EPK_MAGIC:
         res = rebuild_epk(data, o, log, lambda f: prog(f))
     else:
+        enc0, o.plain, o.blobs = o.encoding, None, []
+        if o.bundle:
+            o.encoding = "raw"
         res = html_pack(data, o, log, prog)
+        if o.bundle:
+            bundled = bundle_page(res, o.blobs, o, log)
+            if o.plain is not None and len(o.plain) <= len(bundled):
+                log("bundle: gzip can't shrink the already-LZMA'd payloads, using plain latin1 (%.2f MB) instead" % (len(o.plain) / 1e6))
+                bundled = o.plain
+            res = bundled
+            o.encoding = enc0
     if o.cancel.is_set():
         raise Cancelled()
     if len(res) >= len(data):
@@ -920,7 +990,7 @@ def gui():
         pass
     pad = dict(padx=8, pady=4)
 
-    v_audio = tk.BooleanVar(value=True); v_strip = tk.BooleanVar(value=False); v_kbps = tk.StringVar(value="24"); v_rate = tk.StringVar(value="Keep original")
+    v_audio = tk.BooleanVar(value=True); v_strip = tk.BooleanVar(value=False); v_bundle = tk.BooleanVar(value=False); v_drop = tk.StringVar(value=""); v_langs = tk.StringVar(value=""); v_kbps = tk.StringVar(value="24"); v_rate = tk.StringVar(value="Keep original")
     v_mono = tk.BooleanVar(value=False); v_deflate = tk.BooleanVar(value=True); v_level = tk.IntVar(value=9)
     v_suffix = tk.StringVar(value=".small"); v_outdir = tk.StringVar(value=""); v_ffmpeg = tk.StringVar(value=find_ffmpeg())
     v_jobs = tk.IntVar(value=os.cpu_count() or 4); v_preset = tk.StringVar(value="Recommended (24 kbps, UTF-8)"); v_enc = tk.StringVar(value="UTF-8 (works everywhere)")
@@ -990,6 +1060,13 @@ def gui():
     # --- compression
     cf = ttk.LabelFrame(root, text="Compression"); cf.pack(fill="x", **pad)
     ttk.Checkbutton(cf, text="Strong compression: LZMA for the game JS and assets, PNGs stored as raw pixels (unpacked by the page at load)", variable=v_deflate).grid(row=0, column=0, columnspan=3, sticky="w", **pad)
+    ttk.Checkbutton(cf, text="Bundle: gzip the whole page into one latin-1 text block (smallest; open the file directly)", variable=v_bundle).grid(row=5, column=0, columnspan=3, sticky="w", **pad)
+    ttk.Label(cf, text="Keep only languages:").grid(row=6, column=0, sticky="w", **pad)
+    ttk.Entry(cf, textvariable=v_langs, width=20).grid(row=6, column=1, sticky="w", **pad)
+    ttk.Label(cf, text="e.g. en_US  (empty = keep all; every .lang file removed saves space)", foreground="#666").grid(row=6, column=2, sticky="w", **pad)
+    ttk.Label(cf, text="Remove files matching:").grid(row=7, column=0, sticky="w", **pad)
+    ttk.Entry(cf, textvariable=v_drop).grid(row=7, column=1, columnspan=2, sticky="we", **pad)
+    ttk.Label(cf, text="space separated patterns, e.g. assets/eagler/boot_menu/* relay_download.zip", foreground="#666").grid(row=8, column=0, columnspan=3, sticky="w", **pad)
     ttk.Label(cf, text="Compression level:").grid(row=1, column=0, sticky="w", **pad)
     lvl_lbl = ttk.Label(cf, text="9", width=3)
     sc = ttk.Scale(cf, from_=1, to=9, orient="horizontal", command=lambda x: (v_level.set(int(round(float(x)))), lvl_lbl.config(text=str(v_level.get()))))
@@ -1053,7 +1130,7 @@ def gui():
             kbps = int(v_kbps.get()); assert 6 <= kbps <= 256
         except Exception:
             messagebox.showerror("MinifyEag", "Bitrate must be a number between 6 and 256."); return
-        o = Opts(audio=v_audio.get(), strip_audio=v_strip.get(), kbps=kbps, max_rate=RATES.get(v_rate.get(), 0), mono=v_mono.get(), deflate=v_deflate.get(),
+        o = Opts(audio=v_audio.get(), strip_audio=v_strip.get(), bundle=v_bundle.get(), drop=v_drop.get().split(), langs=v_langs.get().strip(), kbps=kbps, max_rate=RATES.get(v_rate.get(), 0), mono=v_mono.get(), deflate=v_deflate.get(),
                  level=v_level.get(), jobs=max(1, v_jobs.get()), ffmpeg=v_ffmpeg.get().strip() or "ffmpeg", encoding=ENC_LABELS[v_enc.get()])
         suffix = v_suffix.get() or ".small"
         outdir = v_outdir.get().strip()
@@ -1096,6 +1173,9 @@ def main():
     ap.add_argument("--mono", action="store_true", help="force mono audio")
     ap.add_argument("--no-audio", action="store_true", help="skip audio re-encoding")
     ap.add_argument("--strip-audio", action="store_true", help="remove all sounds (.ogg) from the client")
+    ap.add_argument("--drop", action="append", default=[], metavar="GLOB", help="remove EPK entries matching this pattern, e.g. 'assets/eagler/boot_menu/*' (repeatable)")
+    ap.add_argument("--langs", default="", help="keep only these language files, e.g. en_US (comma separated)")
+    ap.add_argument("--bundle", action="store_true", help="gzip the whole page and store it as latin1 text (smallest; open it as a file)")
     ap.add_argument("--no-deflate", action="store_true", help="store big assets uncompressed (no LZMA)")
     ap.add_argument("--encoding", choices=ENCODINGS, default="utf8",
                     help="how the data is written into the html: utf8 (safe everywhere, default), utf16 (~7%% smaller, page is saved as UTF-16) or latin1 (smallest, ~1.6%% overhead; only works when the browser reads the file as windows-1252, e.g. opened from disk)")
@@ -1112,7 +1192,7 @@ def main():
             sys.exit("the window needs tkinter (on Linux: sudo apt install python3-tk). Or pass files on the command line.")
         return
     o = Opts(audio=not a.no_audio, kbps=a.kbps, max_rate=a.max_rate, mono=a.mono, deflate=not a.no_deflate,
-             level=a.level, strip_audio=a.strip_audio, jobs=a.jobs, ffmpeg=a.ffmpeg or find_ffmpeg(), encoding=a.encoding)
+             level=a.level, strip_audio=a.strip_audio, drop=a.drop, langs=a.langs, bundle=a.bundle, jobs=a.jobs, ffmpeg=a.ffmpeg or find_ffmpeg(), encoding=a.encoding)
     for src in a.inputs:
         if a.output and len(a.inputs) == 1:
             dst = a.output
