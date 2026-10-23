@@ -23,7 +23,7 @@ What it does
 
 needs: python 3, numpy, ffmpeg with libvorbis (only for the audio step)
 """
-import argparse, base64, fnmatch, lzma, os, queue, re, shutil, struct, subprocess, sys, threading, zlib
+import json, gzip, hashlib, argparse, base64, fnmatch, lzma, os, queue, re, shutil, struct, subprocess, sys, threading, zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import numpy as np
@@ -48,6 +48,7 @@ class Opts:
     kbps: int = RECOMMENDED_KBPS
     max_rate: int = 0          # 0 = keep original sample rate
     mono: bool = False
+    lzma_inline: bool = False  # experimental: LZMA for eag-inline-* pages (needs the page to read its blocks via textContent/text/innerHTML)
     deflate: bool = True
     level: int = 9             # 1 (fast) .. 9 (smallest)
     encoding: str = "utf8"     # how the binary payload is written into the html: utf8 | utf16 | latin1
@@ -183,13 +184,14 @@ def to_vorbis(data, o):
     ch2 = 1 if o.mono else ch
     if kbps <= o.kbps and sr2 == sr and ch2 == ch:  # already at/below target: leave alone
         return "skip", None
-    r = subprocess.run(
-        [o.ffmpeg, "-v", "error", "-i", "pipe:0", "-vn", "-map_metadata", "-1", "-fflags", "+bitexact", "-flags:a", "+bitexact",
-         "-c:a", "libvorbis", "-b:a", "%dk" % o.kbps, "-ar", str(sr2), "-ac", str(ch2),
-         "-f", "ogg", "pipe:1"],
-        input=data, capture_output=True, creationflags=NOWIN)
-    if r.returncode == 0 and r.stdout:
-        return "ok", r.stdout
+    for kb in sorted({o.kbps, max(o.kbps, 32), max(o.kbps, 48), max(o.kbps, 64), max(o.kbps, 96)}):  # libvorbis refuses some low rates for stereo / high sample rates
+        r = subprocess.run(
+            [o.ffmpeg, "-v", "error", "-i", "pipe:0", "-vn", "-map_metadata", "-1", "-fflags", "+bitexact", "-flags:a", "+bitexact",
+             "-c:a", "libvorbis", "-b:a", "%dk" % kb, "-ar", str(sr2), "-ac", str(ch2),
+             "-f", "ogg", "pipe:1"],
+            input=data, capture_output=True, creationflags=NOWIN)
+        if r.returncode == 0 and r.stdout:
+            return "ok", r.stdout
     return "fail", r.stderr.decode("utf8", "replace").strip()[:200]
 
 
@@ -470,6 +472,7 @@ def pack_epk(raw, o, log, sub):
             log("  audio re-encode saves %.2f MB after compression" % ((len(orig[2]) - len(streams["ogg"][2])) / 1e6))
     idx = {c: i + 1 for i, c in enumerate(c for c in order if c in streams)}
     total = len(head) + 1 + sum(4 + 1 + len(n.encode()) + 1 + p[5] for (t, n, *_), p in zip(ents, parts)) + 4 + len(tail0)
+    o.epk_total = total
     meta = bytearray(b"\x01") + varint(total) + varint(len(head)) + head + varint(len(tail0)) + tail0 + varint(len(parts))
     for (t, n, k, cls, extra, _) in parts:
         nb = n.encode()
@@ -870,10 +873,540 @@ def pack_inline_blocks(html, o, log, prog):
     return bytes(out + html[pos:])
 
 
+# layout D (Incari single-file build): <script type="application/x-incari-file" data-path="..." data-encoding="gzip">base64</script>
+# The page's loader decodes a file when it is first asked for, so a file that is left out simply isn't served.
+# Sound and language files have hashed names (assets/objects/ab/abcdef...); asset-index.json maps them to real names.
+INCARI_BLK = re.compile(rb'<script type="application/x-incari-file" data-path="([^"]*)" data-type="[^"]*"(?: data-encoding="([^"]*)")?[^>]*>(.*?)</script>\n?', re.S)
+
+
+def pack_incari_light(html, o, log, prog):
+    blocks = list(INCARI_BLK.finditer(html))
+    if not blocks:
+        return None
+    index = None
+    for m in blocks:
+        if m.group(1) == b"asset-index.json":
+            raw = base64.b64decode(m.group(3))
+            if m.group(2) == b"gzip":
+                raw = gzip.decompress(raw)
+            index = json.loads(raw)
+    names = {v["hash"]: k for k, v in (index or {}).get("objects", {}).items()}
+    langs = {x.strip().lower() for x in o.langs.replace(";", ",").split(",") if x.strip()}
+
+    def name_of(path):
+        return names.get(path.rsplit("/", 1)[-1], "")
+
+    def dropped(path):
+        nm = name_of(path)
+        low = nm.lower()
+        if o.strip_audio and low.endswith(".ogg"):
+            return True
+        if langs and "/lang/" in low and low.rsplit("/", 1)[-1].rsplit(".", 1)[0] not in langs:
+            return True
+        return any(fnmatch.fnmatchcase(path, g) or (nm and fnmatch.fnmatchcase(nm, g)) for g in o.drop)
+
+    out, pos, gone, gone_bytes = bytearray(), 0, 0, 0
+    ents, where = [], []
+    for k, m in enumerate(blocks):
+        path = m.group(1).decode()
+        if path.startswith("assets/objects/") and dropped(path):
+            out += html[pos:m.start()]
+            pos = m.end()
+            gone += 1
+            gone_bytes += m.end() - m.start()
+        elif o.audio and not o.strip_audio and name_of(path).lower().endswith(".ogg"):
+            data = base64.b64decode(m.group(3))
+            ents.append([b"FILE", name_of(path), gzip.decompress(data) if m.group(2) == b"gzip" else data])
+            where.append(m)
+    if gone:
+        log("  removed %d files (%.2f MB of text)" % (gone, gone_bytes / 1e6))
+    if ents:
+        shrink_audio(ents, o, log, lambda f: prog(f))
+    # audio re-encoding rewrites the kept blocks, so apply it on the assembled page
+    res = bytes(out + html[pos:]) if gone else html
+    if ents:
+        new = {}
+        for e, m in zip(ents, where):
+            old = base64.b64decode(m.group(3))
+            data = e[2]
+            if m.group(2) == b"gzip":
+                c = zlib.compressobj(9, zlib.DEFLATED, 31)
+                data = c.compress(data) + c.flush()
+            if len(data) < len(old):
+                new[m.group(1)] = data
+        if new:
+            def sub(m):
+                return (m.group(0)[:m.start(3) - m.start(0)] + base64.b64encode(new[m.group(1)]) + m.group(0)[m.end(3) - m.start(0):]) if m.group(1) in new else m.group(0)
+            res = INCARI_BLK.sub(sub, res)
+            log("  re-encoded %d sounds" % len(new))
+    if not gone and res is html:
+        log("  nothing to remove (try --strip-audio, --langs en_US or --drop)")
+        return None
+    return res
+
+
+# Strong mode for Incari pages: the base64 text (+33%) and per-file gzip are replaced by solid LZMA streams
+# (sounds / text / binaries grouped, big files alone) written with the same 7-bit / 15-bit / 8-bit text
+# encodings as the Eaglercraft clients. The page's own loader gets two small patches so it can ask for them.
+INCARI_BLK2 = re.compile(rb'<script type="application/x-incari-file" data-path="([^"]*)" data-type="([^"]*)"(?: data-encoding="([^"]*)")?[^>]*>(.*?)</script>\n?', re.S)
+INCARI_MARK = b"\x00EAGGROUPS\x00"
+INCARI_GROUP_LIMIT = 8 << 20   # raw bytes per solid group: bounds what the page decodes on first use of a file
+INCARI_ALONE = 1 << 20         # files at least this big get a stream of their own (wasm, jar, ...)
+
+INCARI_LOADER = r"""
+const EAG_M = %d;
+const eagCache = new Map();
+let eagMan = null;
+function eagGet(g) {
+  let p = eagCache.get(g);
+  if (p === undefined) {
+    p = Promise.resolve().then(() => eaglerDecode("eag-g-" + g, eagMan.g[g][0]));
+    eagCache.set(g, p);
+  }
+  return p;
+}
+export function embeddedFiles(document) {
+  eagMan = JSON.parse(new TextDecoder().decode(eaglerDecode("eag-m", EAG_M)));
+  const base = embeddedFilesBase(document);
+  return base.concat(eagMan.f.map(([path, t, g, off, len]) => ({
+    path,
+    type: eagMan.t[t],
+    gzip: false,
+    text: () => "",
+    dec: async () => {
+      const u = await eagGet(g);
+      const blob = new Blob([u.subarray(off, off + len)], { type: eagMan.t[t] });
+      if (--eagMan.g[g][1] === 0) {
+        eagCache.delete(g);
+      }
+      return blob;
+    },
+  })));
+}
+"""
+
+
+def patch_incari_loader(shell, manlen):
+    a = b"  const text = file.text();\n"
+    b = b"export function embeddedFiles("
+    c = b"\nstart(window);\n</script>"
+    if shell.count(a) != 1 or shell.count(b) != 1 or shell.count(c) != 1:
+        raise ValueError("this Incari page's loader isn't the version MinifyEag knows how to patch")
+    shell = shell.replace(a, b"  if (file.dec !== undefined) {\n    return file.dec();\n  }\n" + a, 1)
+    shell = shell.replace(b, b"function embeddedFilesBase(", 1)
+    return shell.replace(c, (INCARI_LOADER % manlen).encode() + c, 1)
+
+
+def pack_incari_files(html, o, log, prog):
+    if not o.deflate:
+        return pack_incari_light(html, o, log, prog)
+    blocks = list(INCARI_BLK2.finditer(html))
+    if not blocks:
+        return None
+    if re.search(rb"content-security-policy", html, re.I):
+        log("page has a Content-Security-Policy: using the light (no LZMA) mode")
+        return pack_incari_light(html, o, log, prog)
+    index = None
+    for m in blocks:
+        if m.group(1) == b"asset-index.json":
+            raw = base64.b64decode(m.group(4))
+            index = json.loads(gzip.decompress(raw) if m.group(3) == b"gzip" else raw)
+    names = {v["hash"]: k for k, v in (index or {}).get("objects", {}).items()}
+    langs = {x.strip().lower() for x in o.langs.replace(";", ",").split(",") if x.strip()}
+
+    def name_of(path):
+        return names.get(path.rsplit("/", 1)[-1], "")
+
+    def dropped(path):
+        nm = name_of(path); low = nm.lower()
+        if o.strip_audio and low.endswith(".ogg"):
+            return True
+        if langs and "/lang/" in low and low.rsplit("/", 1)[-1].rsplit(".", 1)[0] not in langs:
+            return True
+        return any(fnmatch.fnmatchcase(path, g) or (nm and fnmatch.fnmatchcase(nm, g)) for g in o.drop)
+
+    # 1. read every block that will be re-packed
+    out, pos, gone, items = bytearray(), 0, 0, []
+    for m in blocks:
+        path = m.group(1).decode()
+        obj = path.startswith("assets/objects/")
+        if obj and dropped(path):
+            out += html[pos:m.start()]; pos = m.end(); gone += 1
+            continue
+        if path.endswith(".js"):  # scripts stay as they are: the page decodes them before anything else
+            continue
+        data = base64.b64decode(m.group(4))
+        if m.group(3) == b"gzip":
+            data = gzip.decompress(data)
+        out += html[pos:m.start()]
+        if not items:
+            out += INCARI_MARK
+        pos = m.end()
+        nm = name_of(path) if obj else path
+        ext = nm.rsplit(".", 1)[-1].lower() if "." in nm else ""
+        items.append(dict(path=path, type=m.group(2).decode(), data=data, nm=nm,
+                          cls="ogg" if ext == "ogg" else ("txt" if ext in TEXT_EXT else "bin")))
+    if not items:
+        return None
+    shell = bytes(out + html[pos:])
+    del out
+    if gone:
+        log("  removed %d files" % gone)
+    prog(0.02)
+
+    # 2. audio
+    if o.audio and not o.strip_audio:
+        ents = [[b"FILE", it["nm"], it["data"]] for it in items if it["cls"] == "ogg"]
+        if ents:
+            shrink_audio(ents, o, log, lambda f: prog(0.02 + 0.4 * f))
+            for it, e in zip([it for it in items if it["cls"] == "ogg"], ents):
+                it["data"] = e[2]
+
+    # 3. solid groups
+    groups = []
+    for cls in ("txt", "bin", "ogg"):
+        cur, size = [], 0
+        for it in sorted((i for i in items if i["cls"] == cls), key=lambda i: (len(i["data"]) >= INCARI_ALONE, i["nm"])):
+            n = len(it["data"])
+            if n >= INCARI_ALONE:
+                if cur:
+                    groups.append((cls, cur)); cur, size = [], 0
+                groups.append((cls, [it]))
+                continue
+            if cur and size + n > INCARI_GROUP_LIMIT:
+                groups.append((cls, cur)); cur, size = [], 0
+            cur.append(it); size += n
+        if cur:
+            groups.append((cls, cur))
+
+    done = [0]
+    def work(g):
+        if o.cancel.is_set():
+            return None
+        cls, its = g
+        buf = b"".join(i["data"] for i in its)
+        r = pack_raw(buf, cls, o)
+        done[0] += len(buf)
+        prog(0.45 + 0.5 * done[0] / total_raw)
+        return len(buf), r
+    total_raw = max(sum(len(i["data"]) for i in items), 1)
+    with ThreadPoolExecutor(o.jobs) as ex:
+        res = list(ex.map(work, groups))
+    if o.cancel.is_set():
+        raise Cancelled()
+
+    types, files, gl, pk = [], [], [], Pack()
+    pay = bytearray()
+    for gi, ((cls, its), (rawlen, cont)) in enumerate(zip(groups, res)):
+        off = 0
+        for it in its:
+            if it["type"] not in types:
+                types.append(it["type"])
+            files.append([it["path"], types.index(it["type"]), gi, off, len(it["data"])])
+            off += len(it["data"])
+        gl.append([len(cont), len(its)])
+        pay += pk.add(b"eag-g-%d" % gi, cont)
+    man = json.dumps(dict(t=types, g=gl, f=files), separators=(",", ":")).encode()
+    mcont = pack_raw(man, "txt", o)
+    # the manifest goes first so the page can find it
+    placeholders = pk.add(b"eag-m", mcont) + bytes(pay)
+    before = sum(len(m.group(0)) for m in blocks if not m.group(1).decode().endswith(".js"))
+    log("  %d files in %d solid streams, manifest %d KB" % (len(items), len(groups), len(mcont) // 1024))
+    for cls in ("txt", "bin", "ogg"):
+        gs = [(len(i["data"]) for i in its) for c, its in groups if c == cls]
+        raw = sum(sum(g) for g in gs)
+        comp = sum(len(r[1]) for (c, _), r in zip(groups, res) if c == cls)
+        if raw:
+            log("  %-4s %.2f MB -> %.2f MB" % (cls, raw / 1e6, comp / 1e6))
+
+    shell = shell.replace(INCARI_MARK, placeholders, 1)
+    shell = patch_incari_loader(shell, len(mcont))
+    m = re.search(rb"<script[\s>]", shell)
+    shell = shell[:m.start()] + build_decoder(o.encoding) + shell[m.start():]
+    return finalize(shell, pk, o, log)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Layout E (Eagler26 offline page, "eagler26-offline-html"): the payload is a list of resources (wasm, asset and
+# sound archives, ...) described by a JSON block and stored as windows-1252 text chunks:
+#   <script type="application/x-eagler26-chunk" data-r="NAME" data-len="N" data-sum="S">TEXT</script><script>__eaglerOffline.take()</script>
+# The sound archives (identity .bin + gzip .idx with {ranges:{name:[offset,length]}}) are ~75% of the file. They are
+# re-encoded and the archive rebuilt; the big gzip resources become LZMA; the text escaping goes from 36 escaped byte
+# values (+14%) to 4 (+1.6%). The page's loader is patched to match (decode(), and fetch() of LZMA resources).
+E26_META = re.compile(rb'(<script id="eagler26-offline-meta" type="application/json">)(.*?)(</script>)', re.S)
+E26_CHUNK = re.compile(rb'<script type="application/x-eagler26-chunk" data-r="([^"]*)" data-len="(\d+)" data-sum="(\d+)">([^<]*)</script><script>__eaglerOffline\.take\(\)</script>\n?')
+E26_PART = 8 << 20
+E26_BIG = 32 << 20
+
+E26_DECODE_OLD = b"""  function decode(text, out) {
+    var n = text.length, j = 0, s1 = 0, s2 = 0, c;
+    for (var i = 0; i < n; i++) {
+      c = text.charCodeAt(i);
+      if (c === ESC) c = UNESC[text.charCodeAt(++i) - ESC_BASE];
+      else if (c > 255) return -1;
+      out[j++] = c;"""
+E26_DECODE_NEW = b"""  var CP = Object.create(null), ESCS = [0, 13, 60, 1];
+  (function () { var d = new TextDecoder('windows-1252'); for (var k = 128; k < 160; k++) CP[d.decode(new Uint8Array([k])).charCodeAt(0)] = k; })();
+  function decode(text, out) {
+    var n = text.length, j = 0, s1 = 0, s2 = 0, c;
+    for (var i = 0; i < n; i++) {
+      c = text.charCodeAt(i);
+      if (c > 255) { c = CP[c]; if (c === undefined) return -1; }
+      if (c === 1) c = ESCS[text.charCodeAt(++i) - 48];
+      out[j++] = c;"""
+E26_SERVE_OLD = b"    var res = META.resources[key], blob = E.blobs[key];\n"
+E26_SERVE_NEW = E26_SERVE_OLD + b"""    if (res && res.encoding === 'lzma' && lzDone[key]) { blob = lzDone[key]; res = {kind: res.kind, type: res.type, encoding: 'identity', size: res.size}; }
+"""
+E26_FETCH_OLD = b"        return Promise.resolve(serve(key, input, init));"
+E26_FETCH_NEW = b"        return unpack(key).then(function () { return serve(key, input, init); });"
+E26_INSTALL_OLD = b"  function installFetch() {"
+E26_UNPACK = b"""  // Resources MinifyEag stored as LZMA are unpacked on their first fetch and then served like identity ones.
+  var lzDone = Object.create(null), lzBusy = Object.create(null);
+  function unpack(key) {
+    var res = META.resources[key];
+    if (!res || res.encoding !== 'lzma' || !E.blobs[key] || lzDone[key]) return Promise.resolve();
+    return lzBusy[key] || (lzBusy[key] = E.blobs[key].arrayBuffer().then(function (ab) {
+      lzDone[key] = new Blob([eaglerLzma(new Uint8Array(ab), 0, res.size, res.lz)]);
+    }));
+  }
+"""
+
+
+def e26_unescape(b, unsafe, esc, base):
+    a = np.frombuffer(b, dtype=np.uint8)
+    e = np.flatnonzero(a == esc)
+    if not len(e):
+        return bytes(b)
+    out = a.copy()
+    out[e] = np.array(unsafe, dtype=np.uint8)[a[e + 1].astype(np.int64) - base]
+    keep = np.ones(len(a), dtype=bool)
+    keep[e + 1] = False
+    return out[keep].tobytes()
+
+
+def e26_sum(data):
+    a = np.frombuffer(data, dtype=np.uint8).astype(np.int64)
+    s1 = int(a.sum())
+    s2 = int((np.arange(len(a), 0, -1, dtype=np.int64) * a).sum())
+    return ((s1 & 0xffff) ^ ((s2 & 0xffff) << 16)) & 0xffffffff
+
+
+def e26_gz(b):
+    c = zlib.compressobj(9, zlib.DEFLATED, 31)
+    return c.compress(b) + c.flush()
+
+
+def pack_eagler26(html, o, log, prog):
+    mm = E26_META.search(html)
+    if not mm:
+        return None
+    chunks = list(E26_CHUNK.finditer(html))
+    if not chunks:
+        return None
+    meta = json.loads(mm.group(2))
+    R = meta["resources"]
+    enc = meta["encoding"]
+    spans, order = {}, []
+    for m in chunks:
+        nm = m.group(1).decode()
+        if nm not in spans:
+            spans[nm] = []; order.append(nm)
+        spans[nm].append(m)
+    head, tail = html[:chunks[0].start()], html[chunks[-1].end():]
+    meta_start, meta_end = mm.start(2), mm.end(2)
+    assert meta_end <= len(head)
+    old_id = meta["build"]["contentId"]
+
+    def stored(nm):
+        parts = []
+        for m in spans[nm]:
+            d = e26_unescape(m.group(4), enc["unsafe"], enc["escape"], enc["base"])
+            if len(d) != int(m.group(2)):
+                raise ValueError("chunk of %s is damaged in the source file" % nm)
+            parts.append(d)
+        return b"".join(parts)
+
+    def raw(nm):
+        d = stored(nm)
+        return gzip.decompress(d) if R[nm]["encoding"] == "gzip" else d
+
+    new = {}  # resource name -> stored bytes, for everything rewritten
+    A = meta.get("audio") or {}
+    inc = A.get("included") or {}
+    changed_meta = False
+
+    # --- drop things
+    gone = set()
+    for cat in list(inc):
+        if o.strip_audio:
+            gone.update((inc[cat]["idx"], inc[cat]["bin"]))
+    for nm in R:
+        if any(fnmatch.fnmatchcase(nm, g) for g in o.drop):
+            gone.add(nm)
+    for cat in list(inc):
+        if inc[cat]["idx"] in gone or inc[cat]["bin"] in gone:
+            gone.update((inc[cat]["idx"], inc[cat]["bin"]))
+            del inc[cat]
+            bc = meta["build"].get("audio", {}).get(cat)
+            if bc:
+                bc.update(included=False, files=0, bytes=0)
+    if gone:
+        log("  removed %d resources: %s" % (len(gone), ", ".join(sorted(gone))))
+    prog(0.02)
+
+    # --- audio: re-encode every sound and rebuild each archive + index
+    if o.audio and not o.strip_audio:
+        cats = [c for c in A.get("order", []) if c in inc]
+        for ci, cat in enumerate(cats):
+            ib, bn = inc[cat]["idx"], inc[cat]["bin"]
+            idx = json.loads(raw(ib)); binary = raw(bn)
+            ranges = idx["ranges"]
+            uniq = sorted({(off, ln) for off, ln in ranges.values()})
+            ents = [[b"FILE", "%d.ogg" % off, binary[off:off + ln]] for off, ln in uniq]
+            log("  %s: %d sounds, %.2f MB" % (cat, len(ents), len(binary) / 1e6))
+            shrink_audio(ents, o, log, lambda f, ci=ci: prog(0.02 + 0.5 * (ci + f) / len(cats)))
+            newoff, buf, pos = {}, [], 0
+            for key, e in zip(uniq, ents):
+                newoff[key] = pos; buf.append(e[2]); pos += len(e[2])
+            del ents, binary
+            lens = {key: len(b) for key, b in zip(uniq, buf)}
+            idx["ranges"] = {k: [newoff[(off, ln)], lens[(off, ln)]] for k, (off, ln) in ranges.items()}
+            idx["bytes"] = pos
+            nb = b"".join(buf); del buf
+            new[bn] = nb
+            R[bn].update(size=len(nb), stored=len(nb), encoding="identity")
+            ji = json.dumps(idx, separators=(",", ":")).encode()
+            new[ib] = e26_gz(ji)
+            R[ib].update(size=len(ji), stored=len(new[ib]), encoding="gzip")
+            bc = meta["build"].get("audio", {}).get(cat)
+            if bc:
+                bc["bytes"] = len(nb)
+            changed_meta = True
+
+    # --- LZMA for the big gzip resources
+    if o.deflate:
+        big = [nm for nm in order if nm in R and nm not in gone and R[nm]["kind"] == "data" and R[nm]["encoding"] == "gzip"
+               and R[nm]["size"] >= 65536 and not nm.startswith("audio/")]
+        def work(nm):
+            if o.cancel.is_set():
+                return nm, None
+            data = raw(nm)
+            cls = "txt" if R[nm]["type"] in ("application/json", "text/javascript") else "bin"
+            if len(data) > E26_BIG:  # one candidate only: another pass over 100 MB isn't worth the time
+                c = lz_encode(data, 3, 0, 0, o.level); props = 3
+            else:
+                props, _, c = make_stream(data, cls, o)
+                if props == STORED:
+                    return nm, None
+            return nm, (props, c, len(data))
+        with ThreadPoolExecutor(o.jobs) as ex:
+            results = list(ex.map(work, big))
+        if o.cancel.is_set():
+            raise Cancelled()
+        for nm, r in results:
+            if r is None:
+                continue
+            props, c, n = r
+            if len(c) >= R[nm]["stored"]:
+                log("  %s: LZMA %.2f MB isn't smaller than gzip %.2f MB, kept gzip" % (nm, len(c) / 1e6, R[nm]["stored"] / 1e6))
+                continue
+            log("  %s: gzip %.2f MB -> LZMA %.2f MB" % (nm, R[nm]["stored"] / 1e6, len(c) / 1e6))
+            new[nm] = c
+            R[nm].update(encoding="lzma", stored=len(c), lz=props)
+            changed_meta = True
+    prog(0.9)
+
+    # --- write the page
+    keep = [nm for nm in order if nm not in gone]
+    body = bytearray()
+    for nm in keep:
+        data = new[nm] if nm in new else stored(nm)
+        R[nm]["stored"] = len(data)
+        for j in range(0, len(data), E26_PART):
+            part = data[j:j + E26_PART]
+            body += (b'<script type="application/x-eagler26-chunk" data-r="%s" data-len="%d" data-sum="%d">' % (nm.encode(), len(part), e26_sum(part)))
+            body += latin1_pack(part)
+            body += b"</script><script>__eaglerOffline.take()</script>\n"
+    for nm in gone:
+        R.pop(nm, None)
+    h = hashlib.md5((old_id + json.dumps(sorted(new)) + str(sorted(gone))).encode()).hexdigest()
+    new_id = h[:len(old_id)]
+    meta["build"]["contentId"] = new_id
+    mj = json.dumps(meta, separators=(",", ":")).replace("<", "\\u003c").encode()
+    head = head[:meta_start] + mj + head[meta_end:]
+    head = head.replace(old_id.encode(), new_id.encode())  # the plain build block carries the same id
+    for a, b in ((E26_DECODE_OLD, E26_DECODE_NEW), (E26_SERVE_OLD, E26_SERVE_NEW), (E26_FETCH_OLD, E26_FETCH_NEW),
+                 (E26_INSTALL_OLD, E26_UNPACK + E26_INSTALL_OLD)):
+        if head.count(a) != 1:
+            raise ValueError("this Eagler26 page's loader isn't the version MinifyEag knows how to patch")
+        head = head.replace(a, b, 1)
+    i = head.find(b"<script>\n// Eagler26 offline bootstrap")
+    if i < 0:
+        raise ValueError("couldn't find the Eagler26 loader")
+    head = head[:i] + b"<script>\n" + DEC_LZMA.encode() + b"</script>\n" + head[i:]
+    res = bytes(head) + bytes(body) + tail
+    if o.encoding != "utf8":
+        log("  note: Eagler26 pages are written as windows-1252 text (like the original), the --encoding option doesn't apply")
+    return res
+
+
+# layout C, LZMA variant (opt-in): the page's own block <script id="eag-inline-*" data-size=N> stays, but empty. The
+# EPK goes into a solid LZMA container next to it, and a small script makes the block's text (textContent / text /
+# innerHTML / innerText) read as the base64 of the rebuilt EPK, so the page's own loader needs no change.
+INLINE_SHIM = r"""<script>(function(T){
+var by={},cache={};T.forEach(function(t){by[t[0]]=t});
+function b64(u){var s="",i=0,n=u.length;for(;i<n;i+=32768)s+=String.fromCharCode.apply(null,u.subarray(i,i+32768));return btoa(s)}
+function get(el){var t=el&&el.id&&by[el.id];if(!t||el.tagName!=="SCRIPT")return null;
+if(cache[el.id]===undefined)cache[el.id]=b64(eaglerDecode(t[1],t[2]));return cache[el.id]}
+function wrap(proto,name){var d=Object.getOwnPropertyDescriptor(proto,name);if(!d||!d.get)return;
+Object.defineProperty(proto,name,{configurable:true,enumerable:d.enumerable,get:function(){var v=get(this);return v===null?d.get.call(this):v},set:d.set})}
+wrap(Node.prototype,"textContent");wrap(HTMLScriptElement.prototype,"text");wrap(Element.prototype,"innerHTML");wrap(HTMLElement.prototype,"innerText");
+})(%s)</script>
+"""
+
+
+def pack_inline_lzma(html, o, log, prog, pk):
+    found = list(INLINE_BLK.finditer(html))
+    if not found:
+        return None
+    out, pos, table, saved = bytearray(), 0, [], 0
+    for k, m in enumerate(found):
+        raw = base64.b64decode(m.group(4))
+        name = m.group(0)[m.group(0).index(b'id="') + 4:].split(b'"')[0].decode()
+        if raw[:8] != EPK_MAGIC:
+            log("%s: not an EPK, left as-is" % name)
+            continue
+        cont = pack_epk(raw, o, log, lambda f, k=k: prog((k + f) / len(found)))
+        bid = b"eagler-blob-%d" % k
+        out += html[pos:m.start()] + m.group(1) + b"%d" % o.epk_total + m.group(3) + m.group(5) + pk.add(bid, cont)
+        pos = m.end()
+        table.append([name, bid.decode(), len(cont)])
+        saved += len(m.group(0)) - len(cont)
+        log("%s: %.2f MB (base64) -> %.2f MB (LZMA container)" % (name, len(m.group(0)) / 1e6, len(cont) / 1e6))
+        prog((k + 1) / len(found))
+    if not table:
+        return None
+    pk.shim = (INLINE_SHIM % json.dumps(table, separators=(",", ":"))).encode()
+    return bytes(out + html[pos:])
+
+
 def html_pack(html, o, log, prog):
     if o.encoding not in ENCODINGS:
         raise ValueError("unknown text encoding %r" % o.encoding)
+    if o.lzma_inline and o.deflate:
+        pk = Pack(); o.blobs = []
+        res = pack_inline_lzma(html, o, log, prog, pk)
+        if res is not None:
+            m = re.search(rb"<script[\s>]", res)
+            res = res[:m.start()] + build_decoder(o.encoding) + pk.shim + res[m.start():]
+            return finalize(res, pk, o, log)
     res = pack_inline_blocks(html, o, log, prog)
+    if res is not None:
+        return res
+    res = pack_incari_files(html, o, log, prog)
+    if res is not None:
+        return res
+    res = pack_eagler26(html, o, log, prog)
     if res is not None:
         return res
     pk = Pack()
@@ -937,10 +1470,15 @@ def process_file(src, dst, o, log=print, prog=lambda f: None):
         res = rebuild_epk(data, o, log, lambda f: prog(f))
     else:
         enc0, o.plain, o.blobs = o.encoding, None, []
-        if o.bundle:
+        kind = "Incari" if b"application/x-incari-file" in data else ("Eagler26" if b"eagler26-offline-meta" in data else "")
+        incari = bool(kind)
+        if o.bundle and incari:
+            log("bundle mode is skipped for %s pages (they use their own packing)" % kind)
+        use_bundle = o.bundle and not incari
+        if use_bundle:
             o.encoding = "raw"
         res = html_pack(data, o, log, prog)
-        if o.bundle:
+        if use_bundle:
             bundled = bundle_page(res, o.blobs, o, log)
             if o.plain is not None and len(o.plain) <= len(bundled):
                 log("bundle: gzip can't shrink the already-LZMA'd payloads, using plain latin1 (%.2f MB) instead" % (len(o.plain) / 1e6))
@@ -982,16 +1520,30 @@ def gui():
 
     root = tk.Tk()
     root.title("MinifyEag")
-    root.geometry("800x760")
-    root.minsize(720, 660)
+    win = root
+    canvas = tk.Canvas(win, highlightthickness=0)
+    vsb = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=vsb.set)
+    vsb.pack(side="right", fill="y"); canvas.pack(side="left", fill="both", expand=True)
+    body = ttk.Frame(canvas)
+    bid = canvas.create_window((0, 0), window=body, anchor="nw")
+    body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.bind("<Configure>", lambda e: canvas.itemconfigure(bid, width=e.width))
+
+    def wheel(e):
+        if e.widget.winfo_class() in ("Text", "Listbox"):
+            return
+        if body.winfo_reqheight() > canvas.winfo_height():
+            canvas.yview_scroll(-1 * (e.delta // 120 if e.delta else (1 if e.num == 4 else -1)), "units")
+    win.bind_all("<MouseWheel>", wheel); win.bind_all("<Button-4>", wheel); win.bind_all("<Button-5>", wheel)
     try:
         ttk.Style().theme_use("vista" if sys.platform == "win32" else "clam")
     except tk.TclError:
         pass
-    pad = dict(padx=8, pady=4)
+    pad = dict(padx=8, pady=2)
 
     v_audio = tk.BooleanVar(value=True); v_strip = tk.BooleanVar(value=False); v_bundle = tk.BooleanVar(value=False); v_drop = tk.StringVar(value=""); v_langs = tk.StringVar(value=""); v_kbps = tk.StringVar(value="24"); v_rate = tk.StringVar(value="Keep original")
-    v_mono = tk.BooleanVar(value=False); v_deflate = tk.BooleanVar(value=True); v_level = tk.IntVar(value=9)
+    v_mono = tk.BooleanVar(value=False); v_deflate = tk.BooleanVar(value=True); v_lzin = tk.BooleanVar(value=False); v_level = tk.IntVar(value=9)
     v_suffix = tk.StringVar(value=".small"); v_outdir = tk.StringVar(value=""); v_ffmpeg = tk.StringVar(value=find_ffmpeg())
     v_jobs = tk.IntVar(value=os.cpu_count() or 4); v_preset = tk.StringVar(value="Recommended (24 kbps, UTF-8)"); v_enc = tk.StringVar(value="UTF-8 (works everywhere)")
     v_ffstat = tk.StringVar(); v_status = tk.StringVar(value="Add one or more .html / .epk files to begin")
@@ -1000,8 +1552,8 @@ def gui():
     state = {"opts": None, "running": False}
 
     # --- files
-    fr = ttk.LabelFrame(root, text="Files"); fr.pack(fill="x", **pad)
-    lb = tk.Listbox(fr, height=6, selectmode="extended", activestyle="none")
+    fr = ttk.LabelFrame(body, text="Files"); fr.pack(fill="x", **pad)
+    lb = tk.Listbox(fr, height=4, selectmode="extended", activestyle="none")
     lb.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
     sb = ttk.Scrollbar(fr, command=lb.yview); sb.pack(side="left", fill="y", pady=8); lb.config(yscrollcommand=sb.set)
     bf = ttk.Frame(fr); bf.pack(side="left", padx=8, pady=8)
@@ -1022,7 +1574,7 @@ def gui():
     ttk.Button(bf, text="Clear", command=clear).pack(fill="x", pady=2)
 
     # --- presets
-    pf = ttk.Frame(root); pf.pack(fill="x", **pad)
+    pf = ttk.Frame(body); pf.pack(fill="x", **pad)
     ttk.Label(pf, text="Preset:").pack(side="left")
     pc = ttk.Combobox(pf, textvariable=v_preset, values=list(PRESETS), state="readonly", width=40); pc.pack(side="left", padx=6)
 
@@ -1032,7 +1584,7 @@ def gui():
     pc.bind("<<ComboboxSelected>>", apply_preset)
 
     # --- audio
-    af = ttk.LabelFrame(root, text="Audio"); af.pack(fill="x", **pad)
+    af = ttk.LabelFrame(body, text="Audio"); af.pack(fill="x", **pad)
     ttk.Checkbutton(af, text="Re-encode audio (.ogg inside EPK)", variable=v_audio).grid(row=0, column=0, columnspan=3, sticky="w", **pad)
     ttk.Label(af, text="Bitrate (kbps):").grid(row=1, column=0, sticky="w", **pad)
     ttk.Combobox(af, textvariable=v_kbps, values=["8", "12", "16", "24", "32", "48", "64", "96", "128"], width=8).grid(row=1, column=1, sticky="w", **pad)
@@ -1058,9 +1610,10 @@ def gui():
     af.columnconfigure(2, weight=1)
 
     # --- compression
-    cf = ttk.LabelFrame(root, text="Compression"); cf.pack(fill="x", **pad)
+    cf = ttk.LabelFrame(body, text="Compression"); cf.pack(fill="x", **pad)
     ttk.Checkbutton(cf, text="Strong compression: LZMA for the game JS and assets, PNGs stored as raw pixels (unpacked by the page at load)", variable=v_deflate).grid(row=0, column=0, columnspan=3, sticky="w", **pad)
     ttk.Checkbutton(cf, text="Bundle: gzip the whole page into one latin-1 text block (smallest; open the file directly)", variable=v_bundle).grid(row=5, column=0, columnspan=3, sticky="w", **pad)
+    ttk.Checkbutton(cf, text="Experimental: LZMA for clients that keep their EPK in eag-inline blocks (smaller; try the normal mode first if it fails)", variable=v_lzin).grid(row=9, column=0, columnspan=3, sticky="w", **pad)
     ttk.Label(cf, text="Keep only languages:").grid(row=6, column=0, sticky="w", **pad)
     ttk.Entry(cf, textvariable=v_langs, width=20).grid(row=6, column=1, sticky="w", **pad)
     ttk.Label(cf, text="e.g. en_US  (empty = keep all; every .lang file removed saves space)", foreground="#666").grid(row=6, column=2, sticky="w", **pad)
@@ -1079,7 +1632,7 @@ def gui():
     v_level.trace_add("write", lambda *_: (sc.set(v_level.get()), lvl_lbl.config(text=str(v_level.get()))))
 
     # --- output
-    of = ttk.LabelFrame(root, text="Output"); of.pack(fill="x", **pad)
+    of = ttk.LabelFrame(body, text="Output"); of.pack(fill="x", **pad)
     ttk.Label(of, text="Name suffix:").grid(row=0, column=0, sticky="w", **pad)
     ttk.Entry(of, textvariable=v_suffix, width=12).grid(row=0, column=1, sticky="w", **pad)
     ttk.Label(of, text="Threads:").grid(row=0, column=2, sticky="e", **pad)
@@ -1091,13 +1644,13 @@ def gui():
     of.columnconfigure(1, weight=1)
 
     # --- run
-    rf = ttk.Frame(root); rf.pack(fill="x", **pad)
+    rf = ttk.Frame(body); rf.pack(fill="x", **pad)
     start_btn = ttk.Button(rf, text="Start"); start_btn.pack(side="left")
     cancel_btn = ttk.Button(rf, text="Cancel", state="disabled"); cancel_btn.pack(side="left", padx=6)
     ttk.Label(rf, textvariable=v_status).pack(side="left", padx=10)
-    bar = ttk.Progressbar(root, maximum=1000); bar.pack(fill="x", padx=8)
-    lf = ttk.Frame(root); lf.pack(fill="both", expand=True, **pad)
-    logbox = tk.Text(lf, height=8, state="disabled", wrap="word", font=("Consolas" if sys.platform == "win32" else "monospace", 9))
+    bar = ttk.Progressbar(body, maximum=1000); bar.pack(fill="x", padx=8)
+    lf = ttk.Frame(body); lf.pack(fill="both", expand=True, **pad)
+    logbox = tk.Text(lf, height=5, state="disabled", wrap="word", font=("Consolas" if sys.platform == "win32" else "monospace", 9))
     logbox.pack(side="left", fill="both", expand=True)
     ls = ttk.Scrollbar(lf, command=logbox.yview); ls.pack(side="left", fill="y"); logbox.config(yscrollcommand=ls.set)
 
@@ -1130,7 +1683,7 @@ def gui():
             kbps = int(v_kbps.get()); assert 6 <= kbps <= 256
         except Exception:
             messagebox.showerror("MinifyEag", "Bitrate must be a number between 6 and 256."); return
-        o = Opts(audio=v_audio.get(), strip_audio=v_strip.get(), bundle=v_bundle.get(), drop=v_drop.get().split(), langs=v_langs.get().strip(), kbps=kbps, max_rate=RATES.get(v_rate.get(), 0), mono=v_mono.get(), deflate=v_deflate.get(),
+        o = Opts(audio=v_audio.get(), strip_audio=v_strip.get(), bundle=v_bundle.get(), drop=v_drop.get().split(), langs=v_langs.get().strip(), kbps=kbps, max_rate=RATES.get(v_rate.get(), 0), mono=v_mono.get(), deflate=v_deflate.get(), lzma_inline=v_lzin.get(),
                  level=v_level.get(), jobs=max(1, v_jobs.get()), ffmpeg=v_ffmpeg.get().strip() or "ffmpeg", encoding=ENC_LABELS[v_enc.get()])
         suffix = v_suffix.get() or ".small"
         outdir = v_outdir.get().strip()
@@ -1160,6 +1713,13 @@ def gui():
         root.after(100, poll)
     poll(); ff_check()
     root.api = dict(files=files, start=start, vars=dict(kbps=v_kbps, outdir=v_outdir), lb=lb, state=state, v_status=v_status)
+    # size the window to fit everything, capped to the screen (a scrollbar appears if it still doesn't fit)
+    root.update_idletasks()
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    w = min(max(body.winfo_reqwidth() + 24, 800), sw - 40)
+    h = min(body.winfo_reqheight() + 8, sh - 90)
+    root.minsize(min(body.winfo_reqwidth() + 24, sw - 40), min(420, h))
+    root.geometry("%dx%d+%d+%d" % (w, h, max(0, (sw - w) // 2), max(0, (sh - h) // 4)))
     return root
 
 
@@ -1176,6 +1736,7 @@ def main():
     ap.add_argument("--drop", action="append", default=[], metavar="GLOB", help="remove EPK entries matching this pattern, e.g. 'assets/eagler/boot_menu/*' (repeatable)")
     ap.add_argument("--langs", default="", help="keep only these language files, e.g. en_US (comma separated)")
     ap.add_argument("--bundle", action="store_true", help="gzip the whole page and store it as latin1 text (smallest; open it as a file)")
+    ap.add_argument("--lzma-inline", action="store_true", help="experimental: LZMA for pages whose EPK sits in eag-inline-* blocks (the page must read them through textContent/text/innerHTML)")
     ap.add_argument("--no-deflate", action="store_true", help="store big assets uncompressed (no LZMA)")
     ap.add_argument("--encoding", choices=ENCODINGS, default="utf8",
                     help="how the data is written into the html: utf8 (safe everywhere, default), utf16 (~7%% smaller, page is saved as UTF-16) or latin1 (smallest, ~1.6%% overhead; only works when the browser reads the file as windows-1252, e.g. opened from disk)")
@@ -1192,7 +1753,7 @@ def main():
             sys.exit("the window needs tkinter (on Linux: sudo apt install python3-tk). Or pass files on the command line.")
         return
     o = Opts(audio=not a.no_audio, kbps=a.kbps, max_rate=a.max_rate, mono=a.mono, deflate=not a.no_deflate,
-             level=a.level, strip_audio=a.strip_audio, drop=a.drop, langs=a.langs, bundle=a.bundle, jobs=a.jobs, ffmpeg=a.ffmpeg or find_ffmpeg(), encoding=a.encoding)
+             level=a.level, lzma_inline=a.lzma_inline, strip_audio=a.strip_audio, drop=a.drop, langs=a.langs, bundle=a.bundle, jobs=a.jobs, ffmpeg=a.ffmpeg or find_ffmpeg(), encoding=a.encoding)
     for src in a.inputs:
         if a.output and len(a.inputs) == 1:
             dst = a.output
